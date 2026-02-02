@@ -9,6 +9,7 @@
 - **Offline Operation**: No network dependency; runs on isolated systems
 - **Later Composition**: Chunks are extracted separately; reassembly happens in a post-processing step
 - **Safety First**: Never execute commands without explicit user confirmation; validate device paths rigorously
+- **Two-Mode Operation**: Generate dd commands OR update manifest from actual chunk reads
 
 ## Architecture
 
@@ -18,18 +19,39 @@
 - Linux/POSIX systems only (direct `/dev/sdX` access)
 - All functions, logic, and utilities contained in this single file
 
-### Data Flow
+### Two Operational Modes
+
+#### Mode 1: Command Generation (--generate)
 1. User specifies device, chunk size, and output directory (with optional start/end offsets)
 2. Tool validates parameters: device path, chunk size must be power of 2, offset ranges
 3. Tool calculates extraction range and validates device capacity
 4. Generate sequential `dd` commands for each chunk within the specified range
-5. Output manifest file with chunk metadata (size, offset, checksums)
+5. Output manifest file with chunk metadata (size, offset)
 6. User executes generated commands manually or via provided script
-7. (Post-recovery) Chunks combined into single image using manifest
+
+#### Mode 2: Manifest Update (--update-manifest)
+1. User specifies output directory containing extracted chunk files
+2. Tool scans directory for files matching pattern `disk-*.img`
+3. For each chunk file, reads actual file size (accounts for incomplete reads on error)
+4. Updates manifest with actual end offsets based on real file sizes
+5. Ranges in manifest without corresponding chunk files are kept as-is (considered successfully read)
+6. Contiguous ranges (where end of one equals start of next) are merged into single lines
+7. Outputs updated manifest to standard output for user verification
+8. User can redirect output to file once verified
+
+### Overall Data Flow
+1. Mode 1: Generate dd extraction commands and initial manifest
+2. User executes dd commands (may get partial reads on unreliable devices)
+3. Mode 2: Update manifest based on actual chunk sizes extracted
+4. (Post-recovery) Chunks combined into single image using updated manifest
 
 ## Key Command Patterns
 
-### Parameters
+### Mode Selection
+- `--generate` (or default): Generate dd commands for extraction
+- `--update-manifest`: Update manifest from actual extracted chunk files
+
+### Parameters for Generation (--generate)
 - `--chunk-size`: Size of each extraction chunk (must be power of 2), accepts formats like `512K`, `1M`, `512M`, `1G`. Default: `4G`
 - `--start-offset`: Byte offset to start reading from (default: `0`). Accepts same formats as chunk-size
 - `--end-offset`: Byte offset to stop reading (default: full device size). Accepts same formats as chunk-size
@@ -37,24 +59,37 @@
 - `--manifest`: Path to manifest file (default: `<output-dir>/manifest.txt`)
 - `--device`: Path to device (e.g., `/dev/sdb`)
 
-### Usage Examples (planned)
+### Parameters for Manifest Update (--update-manifest)
+- `--output-dir`: Directory containing extracted chunk files (`disk-*.img`)
+- `--manifest`: Path to manifest file to update (default: `<output-dir>/manifest.txt`)
+
+### Usage Examples
+
+#### Generate Mode
 ```bash
 # Generate extraction script for 4GB chunks from unreliable SSD (full device)
-python3 ssddrescue.py /dev/sdb --chunk-size 4G --output-dir /mnt/storage/chunks
+python3 ssddrescue.py /dev/sdb --generate --chunk-size 4G --output-dir /mnt/storage/chunks
 
 # Extract specific range: 1GB to 5GB in 256MB chunks
-python3 ssddrescue.py /dev/sdb --chunk-size 256M --start-offset 1G --end-offset 5G --output-dir /mnt/storage/chunks
+python3 ssddrescue.py /dev/sdb --generate --chunk-size 256M --start-offset 1G --end-offset 5G --output-dir /mnt/storage/chunks
 
 # Extract last 2GB in 1GB chunks
-python3 ssddrescue.py /dev/sdb --chunk-size 1G --start-offset 8G --output-dir /mnt/storage/chunks
+python3 ssddrescue.py /dev/sdb --generate --chunk-size 1G --start-offset 8G --output-dir /mnt/storage/chunks
 
-# Output: single executable script containing:
-# - dd commands for each chunk
-# - manifest as embedded comment block
-# - recovery instructions
+# Output: manifest file with planned chunk offsets and corresponding dd command list
 ```
 
-### Typical dd Command Generated
+#### Update Manifest Mode
+```bash
+# After running extraction commands, update manifest with actual file sizes
+python3 ssddrescue.py --update-manifest --output-dir /mnt/storage/chunks
+
+# Outputs updated manifest to stdout for verification
+# User can redirect to file once satisfied with changes:
+python3 ssddrescue.py --update-manifest --output-dir /mnt/storage/chunks > /mnt/storage/chunks/manifest.txt
+```
+
+### Typical dd Command Generated (in --generate mode)
 ```bash
 dd if=/dev/sdb of=/mnt/storage/chunks/disk-0-512M.img bs=512 skip=0 count=512MiB status=progress
 ```
