@@ -120,16 +120,20 @@ class DeviceValidator:
 class Chunk(object):
     """Represents a chunk of data to be extracted."""
     
-    def __init__(self, start, end):
+    def __init__(self, start, end, file_name, planned_end=None):
         """
         Initialize chunk with start and end offsets.
         
         Args:
             start: Start offset in bytes
             end: End offset in bytes
+            file_name: Name of the chunk file
+            planned_end: Planned end offset in bytes (optional)
         """
         self.start = start
         self.end = end
+        self.file_name = file_name
+        self.planned_end = planned_end
     
     @property
     def size(self):
@@ -138,7 +142,42 @@ class Chunk(object):
     
     def __str__(self):
         """String representation of the chunk."""
-        return f"Chunk(start={self.start}, end={self.end}, size={self.size})"
+        return f"Chunk(start={self.start}, end={self.end}, size={self.size}, file_name={self.file_name}, planned_end={self.planned_end})"
+
+class ChunkInventory:
+    """Manages inventory of chunks to be extracted."""
+
+    def __init__(self, chunk_dir):
+        """
+        Initialize chunk inventory.
+
+        Args:
+            chunk_dir: Directory containing chunk files
+        """
+        self.chunk_dir = chunk_dir
+        self.chunks = []
+
+    def refresh_chunks(self):
+        """
+        Load chunks from chunk directory.
+        Scans chunk_dir for disk-*.img files and updates self.chunks with their offsets and sizes.
+        """
+        p = pathlib.Path(self.chunk_dir)
+        self.chunks = []
+        for x in p.iterdir():
+            if x.is_file() and re.match(r'^disk-[0-9]+[KMGT]?-[0-9]+[KMGT]?\.img$', x.name):
+                print(f"Found chunk file: {x.name}", file=sys.stderr)
+                (start_offset, end_offset) = re.match(r'^disk-([0-9]+[KMGT]?)-([0-9]+[KMGT]?)\.img$', x.name).groups()
+                start_offset = SizeParser.parse(start_offset)
+                end_offset = SizeParser.parse(end_offset)
+                file_info = x.stat()
+                size = file_info.st_size
+                if size == 0:
+                    print(f"Warning: Chunk file {x.name} has size 0, skipping", file=sys.stderr)
+                    continue
+                real_end_offset = start_offset + size
+                chunk = Chunk(start_offset, real_end_offset, x.name, planned_end=end_offset)
+                self.chunks.append(chunk)
 
 
 class ManifestManager:
@@ -199,7 +238,7 @@ class ManifestManager:
         (start_hex, actual_end_hex) = data.split()
         start = int(start_hex, 16)
         actual_end = int(actual_end_hex, 16)
-        return Chunk(start, actual_end)
+        return Chunk(start, actual_end, None, planned_end=actual_end)
 
     def update_from_chunks(self, output_dir):
         """
@@ -214,21 +253,10 @@ class ManifestManager:
         Returns:
             str: Updated manifest content
         """
-        p = pathlib.Path(output_dir)
         print(f"Updating manifest from chunk files in: {output_dir}", file=sys.stderr)
-        new_chunks = []
-        for x in p.iterdir():
-            if x.is_file() and re.match(r'^disk-[0-9]+[KMGT]?-[0-9]+[KMGT]?\.img$', x.name):
-                print(f"Processing chunk file: {x.name}", file=sys.stderr)
-                (start_offset, ) = re.match(r'^disk-([0-9]+[KMGT]?)-[0-9]+[KMGT]?\.img$', x.name).groups()
-                start_offset = SizeParser.parse(start_offset)
-                file_info = x.stat()
-                size = file_info.st_size
-                if size == 0:
-                    print(f"Warning: Chunk file {x.name} has size 0, skipping", file=sys.stderr)
-                    continue
-                chunk = Chunk(start_offset, start_offset + size)
-                new_chunks.append(chunk)
+        chunk_inventory = ChunkInventory(output_dir)
+        chunk_inventory.refresh_chunks()
+        new_chunks = chunk_inventory.chunks
         self.chunks = self.chunks + new_chunks
         self.chunks.sort(key=lambda c: (c.start, c.end))
         self.chunks = self._merge_chunks()
@@ -325,7 +353,7 @@ class ChunkGenerator:
                 elif current_manifest_chunk.start >= current_offset + self.chunk_size:
                     # No overlap, create new chunk
                     chunk_end = min(current_offset + self.chunk_size, self.end_offset)
-                    chunks.append(Chunk(current_offset, chunk_end))
+                    chunks.append(Chunk(current_offset, chunk_end, None))
                     current_offset = chunk_end
                 else:
                     # Manifest chunk is before current offset, load next manifest chunk
@@ -334,7 +362,7 @@ class ChunkGenerator:
                 print(f"No more manifest chunks, creating new chunk at offset {current_offset}", file=sys.stderr)
                 # Create new chunk
                 chunk_end = min(current_offset + self.chunk_size, self.end_offset)
-                chunks.append(Chunk(current_offset, chunk_end))
+                chunks.append(Chunk(current_offset, chunk_end, None))
                 current_offset = chunk_end
         return chunks
     
@@ -366,6 +394,55 @@ class ChunkGenerator:
         out_path = os.path.join(self.output_dir, f"disk-{start_file}-{end_file}.img")
         dd_command = f"dd if={self.device_path} of={out_path} bs=512 count={size_dd} skip={start_dd} status=progress"
         return dd_command
+
+
+class Reassembler:
+    """Handles reassembly of chunks into a single image file."""
+
+    def __init__(self, chunk_dir, output_image):
+        """
+        Initialize reassembler.
+
+        Args:
+            chunk_dir: Directory containing chunk files
+            output_image: Path to output image file
+        """
+        self.chunk_dir = chunk_dir
+        self.output_image = output_image
+
+    def _generate_dd_command(self, chunk: Chunk):
+        """
+        Generate dd command for a single chunk.
+
+        Args:
+            chunk: Chunk object with start and end offsets
+        """
+        start_dd = SizeParser.format_for_dd(chunk.start)
+        in_path = os.path.join(self.chunk_dir, chunk.file_name)
+        dd_command = f"dd of={self.output_image} if={in_path} bs=512 seek={start_dd} conv=notrunc status=progress"
+        return dd_command
+
+    def reassemble(self):
+        """
+        Reassemble chunks into a single image file.
+
+        Returns:
+            int: Exit code (0 for success, 1 for error)
+        """
+        inventory = ChunkInventory(self.chunk_dir)
+        inventory.refresh_chunks()
+        if not inventory.chunks:
+            print(f"Error: No chunk files found in {self.chunk_dir} to reassemble", file=sys.stderr)
+            return 1
+        # Sort chunks by start offset
+        inventory.chunks.sort(key=lambda c: c.start)
+        # Generate dd commands for each chunk
+        for chunk in inventory.chunks:
+            if chunk.size == 0:
+                print(f"Warning: Chunk {chunk.file_name} has size 0, skipping", file=sys.stderr)
+                continue
+            dd_command = self._generate_dd_command(chunk)
+            print(dd_command)
 
 
 class SSDRescue:
@@ -470,7 +547,21 @@ class SSDRescue:
         print(f"Total size extracted: {SizeParser.format(total_size)}")
         print(f"Total gaps: {SizeParser.format(total_gaps)}")
         return 0
-    
+
+    def run_reassemble_mode(self):
+        """
+        Execute reassemble mode: reassemble chunks into a single image file.
+
+        Returns:
+            int: Exit code (0 for success, 1 for error)
+        """
+        if not self.args.output_image:
+            print("Error: --output-image argument is required for reassemble mode", file=sys.stderr)
+            return 1
+
+        reassembler = Reassembler(self.data_dir, self.args.output_image)
+        return reassembler.reassemble()
+
     def run(self):
         """
         Run the tool in the appropriate mode.
@@ -482,6 +573,8 @@ class SSDRescue:
             return self.run_update_manifest_mode()
         elif self.args.generate:
             return self.run_generate_mode()
+        elif self.args.reassemble:
+            return self.run_reassemble_mode()
         else:
             return self.run_statistics_mode()
 
@@ -521,6 +614,11 @@ Examples:
         action='store_true',
         help='Output statistics about manifest chunks'
     )
+    mode_group.add_argument(
+        '--reassemble',
+        action='store_true',
+        help='Reassemble chunks into a single file'
+    )
     
     # Common arguments
     parser.add_argument(
@@ -556,12 +654,21 @@ Examples:
         '--device-size',
         help='Manually specify device size (overrides automatic detection). Accepts same formats as chunk-size'
     )
+
+    # Reassemble mode specific arguments
+    parser.add_argument(
+        '--output-image',
+        help='Output file path for reassembled image (required for reassemble mode)'
+    )
     
     args = parser.parse_args()
     
     # Validate mode and arguments
     if args.generate and not args.device:
         parser.error('device argument is required for generate mode')
+
+    if args.reassemble and not args.output_image:
+        parser.error('output-image argument is required for reassemble mode')
     
     # Create and run SSDRescue instance
     rescue = SSDRescue(args)
